@@ -27,9 +27,9 @@ def _enemy_capsules(state, agent_index: int) -> list[Position]:
             capsules.append(p)
     return capsules
 
-# 유령을 본격적으로 위험으로 판단하는 거리 임계값
+# Distance threshold to consider ghosts as a serious threat
 GHOST_DANGER_RANGE: float = 5.0
-# 유령이 매우 가까울 때 (즉시 도망)
+# When ghost is extremely close (immediate escape needed)
 GHOST_CRITICAL_RANGE: float = 2.0
 
 # -------------------------
@@ -43,13 +43,13 @@ def create_team() -> list[AgentInfo]:
 
 
 # -------------------------
-# Defensive Agent (개선)
+# Defensive Agent (Enhanced)
 # -------------------------
 
 class DefensiveAgent(pacai.agents.greedy.GreedyFeatureAgent):
     """
-    수비 에이전트: 내 진영을 지키며 침입자를 쫓는다.
-    침입자가 없을 때는 경계선 근처를 순찰한다.
+    Defensive agent: Guards home territory and chases invaders.
+    When no invaders present, patrols near the border.
     """
 
     def __init__(self,
@@ -60,14 +60,14 @@ class DefensiveAgent(pacai.agents.greedy.GreedyFeatureAgent):
 
         self._distances: pacai.search.distance.DistancePreComputer = pacai.search.distance.DistancePreComputer()
 
-        # [개선] 가중치 재조정
-        self.weights['on_home_side'] = 200.0          # 내 진영에 머무르기 강력히 선호
-        self.weights['stopped'] = -150.0               # 멈추지 않기 (기존보다 강화)
-        self.weights['reverse'] = -5.0                 # 왔다갔다 방지 (기존보다 강화)
-        self.weights['num_invaders'] = -1000.0         # 침입자 수 최소화
-        self.weights['distance_to_invader'] = -20.0    # [개선] 침입자 더 빠르게 추격 (-10 → -20)
-        self.weights['distance_to_patrol'] = -3.0      # [신규] 침입자 없을 때 순찰 위치로 이동
-        self.weights['scared_ghost_penalty'] = -500.0  # [신규] 내가 scared 상태일 때 패널티
+        # [Enhanced] Weight adjustments
+        self.weights['on_home_side'] = 200.0          # Strongly prefer staying on home side
+        self.weights['stopped'] = -150.0               # Don't stop (strengthened from baseline)
+        self.weights['reverse'] = -5.0                 # Prevent back-and-forth (strengthened from baseline)
+        self.weights['num_invaders'] = -1000.0         # Minimize number of invaders
+        self.weights['distance_to_invader'] = -20.0    # [Enhanced] Chase invaders faster (-10 → -20)
+        self.weights['distance_to_patrol'] = -3.0      # [New] Move to patrol position when no invaders
+        self.weights['scared_ghost_penalty'] = -500.0  # [New] Penalty when scared (after being hit by capsule)
 
         if override_weights is None:
             override_weights = {}
@@ -92,18 +92,18 @@ def _extract_defensive_features(
     if current_position is None:
         return features
 
-    # 내 진영에 있어야 함
+    # Should stay on home side
     features['on_home_side'] = int(state.is_ghost(agent_index=agent.agent_index))
 
-    # 멈추지 않기
+    # Don't stop
     features['stopped'] = int(action == pacai.core.action.STOP)
 
-    # 왔다갔다 방지
+    # Prevent reversing
     agent_actions = state.get_agent_actions(agent.agent_index)
     if len(agent_actions) > 1:
         features['reverse'] = int(action == state.get_reverse_action(agent_actions[-2]))
 
-    # 침입자 처리
+    # Handle invaders
     invader_positions = state.get_invader_positions(agent_index=agent.agent_index)
     features['num_invaders'] = len(invader_positions)
 
@@ -116,15 +116,15 @@ def _extract_defensive_features(
         if valid_distances:
             features['distance_to_invader'] = min(valid_distances)
     else:
-        # [신규] 침입자가 없으면 경계선 중앙 근처를 순찰
+        # [New] Patrol near border center when no invaders
         board_width = state.board.width
         board_height = state.board.height
         my_side = _team_modifier_from_index(agent.agent_index)
 
-        # 내 진영 경계선 바로 안쪽 열을 순찰 목표로 설정
-        if my_side == -1:  # 레드팀 (왼쪽)
+        # Set patrol target just inside border
+        if my_side == -1:  # Red team (left)
             patrol_col = board_width // 2 - 2
-        else:              # 블루팀 (오른쪽)
+        else:              # Blue team (right)
             patrol_col = board_width // 2 + 1
 
         patrol_row = board_height // 2
@@ -134,7 +134,7 @@ def _extract_defensive_features(
         if d is not None:
             features['distance_to_patrol'] = d
 
-    # [신규] 내가 scared 상태면 패널티 (캡슐 먹혀서 scared 되면 도망가야 함)
+    # [New] Penalty when scared (should flee after being hit by capsule)
     if state.is_scared(agent.agent_index):
         features['scared_ghost_penalty'] = 1.0
 
@@ -142,13 +142,13 @@ def _extract_defensive_features(
 
 
 # -------------------------
-# Offensive Agent (개선)
+# Offensive Agent (Enhanced)
 # -------------------------
 
 class OffensiveAgent(pacai.agents.greedy.GreedyFeatureAgent):
     """
-    공격 에이전트: 상대 음식을 먹되, 유령을 피하고 캡슐을 전략적으로 활용한다.
-    음식을 일정량 먹으면 안전하게 집으로 복귀한다.
+    Offensive agent: Eats opponent food while avoiding ghosts and strategically using capsules.
+    Returns home safely after eating a certain amount of food.
     """
 
     def __init__(self,
@@ -158,17 +158,18 @@ class OffensiveAgent(pacai.agents.greedy.GreedyFeatureAgent):
         super().__init__(**kwargs)
 
         self._distances: pacai.search.distance.DistancePreComputer = pacai.search.distance.DistancePreComputer()
-        self._food_eaten: int = 0  # 현재 들고 있는 음식 수 추적
+        self._food_eaten: int = 0  # Track currently carried food
 
-        # [개선] 가중치 전면 재조정
+        # [Enhanced] Complete weight adjustment
         self.weights['score'] = 100.0
-        self.weights['distance_to_food'] = -2.0           # [개선] 음식 더 적극적으로 추구 (-1 → -2)
-        self.weights['distance_to_enemy_capsule'] = -3.0  # 캡슐 우선순위 약간 상향
-        self.weights['stopped'] = -200.0                  # [신규] 멈추면 강력한 패널티
-        self.weights['reverse'] = -10.0                   # [신규] 왔다갔다 패널티
-        self.weights['distance_to_ghost'] = 20.0          # [개선] 유령 회피 강력히 (기존 거의 없었음)
-        self.weights['ghost_critical'] = -1000.0          # [신규] 유령 바로 옆이면 즉시 도망
-        self.weights['capsule_when_chased'] = -50.0       # [신규] 쫓길 때 캡슐 우선
+        self.weights['distance_to_food'] = -2.0           # [Enhanced] More aggressive food seeking (-1 → -2)
+        self.weights['distance_to_enemy_capsule'] = -3.0  # Slightly higher capsule priority
+        self.weights['stopped'] = -200.0                  # [New] Strong penalty for stopping
+        self.weights['reverse'] = -10.0                   # [New] Penalty for reversing
+        self.weights['distance_to_ghost'] = 20.0          # [Enhanced] Strong ghost avoidance (was minimal)
+        self.weights['ghost_critical'] = -1000.0          # [New] Immediate escape when ghost is adjacent
+        self.weights['capsule_when_chased'] = -50.0       # [New] Prioritize capsule when chased
+        self.weights['avoid_center'] = -5.0               # [New] Penalty for center area (opponent's common path)
 
         if override_weights is None:
             override_weights = {}
@@ -191,7 +192,7 @@ def _extract_offensive_features(
     features['score'] = state.get_normalized_score(agent.agent_index)
     features['stopped'] = int(action == pacai.core.action.STOP)
 
-    # 왔다갔다 방지
+    # Prevent reversing
     agent_actions = state.get_agent_actions(agent.agent_index)
     if len(agent_actions) > 1:
         features['reverse'] = int(action == state.get_reverse_action(agent_actions[-2]))
@@ -200,7 +201,7 @@ def _extract_offensive_features(
     if current_position is None:
         return features
 
-    # ── 유령 거리 계산 (가장 먼저) ─────────────────────────────
+    # ── Ghost distance calculation (first) ─────────────────────────────
     ghost_positions = state.get_nonscared_opponent_positions(agent_index=agent.agent_index)
     ghost_distances = []
     if len(ghost_positions) > 0:
@@ -210,38 +211,39 @@ def _extract_offensive_features(
                 ghost_distances.append(d)
 
     min_ghost_dist = min(ghost_distances) if ghost_distances else 9999
+    has_nonscared_ghosts = len(ghost_positions) > 0
 
-    # [개선] 유령이 매우 가까우면 즉시 도망 (critical 상황)
+    # [Enhanced] Immediate escape when ghost is very close (critical situation)
     if min_ghost_dist <= GHOST_CRITICAL_RANGE:
         features['ghost_critical'] = 1.0
     else:
         features['ghost_critical'] = 0.0
 
-    # [개선] 유령 거리 반영: 가까울수록 강하게 회피
+    # [Enhanced] Ghost distance reflection: stronger avoidance when closer
     if state.is_pacman(agent.agent_index) and min_ghost_dist < GHOST_DANGER_RANGE:
-        # 거리의 역수로 표현: 가까울수록 큰 값 (회피)
+        # Inverse of distance: closer means higher value (avoidance)
         features['distance_to_ghost'] = 1.0 / (min_ghost_dist + 0.1)
     else:
         features['distance_to_ghost'] = 0.0
 
-    # ── 쫓기는 상황 감지 ───────────────────────────────────────
+    # ── Detect being chased ───────────────────────────────────────
     being_chased = state.is_pacman(agent.agent_index) and min_ghost_dist < GHOST_DANGER_RANGE
 
-    # ── 캡슐 ─────────────────────────────────────────────────
+    # ── Capsule ─────────────────────────────────────────────────
     enemy_caps = _enemy_capsules(state, agent.agent_index)
     if len(enemy_caps) > 0:
         cap_distances = [agent._distances.get_distance(current_position, cp) for cp in enemy_caps]
         cap_distances = [d for d in cap_distances if d is not None]
         if cap_distances:
             min_cap_dist = min(cap_distances)
-            # [신규] 쫓기는 상황에서는 캡슐을 더욱 우선시
+            # [New] Prioritize capsule even more when being chased
             if being_chased:
                 features['capsule_when_chased'] = min_cap_dist
             features['distance_to_enemy_capsule'] = min_cap_dist
     else:
         features['distance_to_enemy_capsule'] = 0.0
 
-    # ── 음식 ─────────────────────────────────────────────────
+    # ── Food ─────────────────────────────────────────────────
     food_positions = state.get_food(agent_index=agent.agent_index)
 
     if len(food_positions) > 0:
@@ -254,5 +256,26 @@ def _extract_offensive_features(
             features['distance_to_food'] = min(valid_food_dist)
     else:
         features['distance_to_food'] = -100000
+    
+    # ── [New] Center avoidance ───────────────────────────────────────
+    board_height = state.board.height
+    center_row = board_height / 2.0
+    
+    # Higher value when closer to center
+    # e.g., if map height is 16, center_row = 8, row=8 → 0, row=0 or 16 → 8
+    distance_from_center = abs(current_position.row - center_row)
+    
+    # Normalize center distance (0~1 range)
+    # Half of map height is maximum distance
+    max_vertical_distance = board_height / 2.0
+    normalized_center_distance = distance_from_center / max_vertical_distance
+    
+    # Penalty when close to center (1 - normalized_center_distance)
+    # Center: 1.0, Top/Bottom edges: 0.0
+    # Avoid center only when on opponent side and non-scared ghosts exist
+    if not state.is_ghost(agent_index=agent.agent_index) and has_nonscared_ghosts:
+        features['avoid_center'] = 1.0 - normalized_center_distance
+    else:
+        features['avoid_center'] = 0.0
 
     return features
